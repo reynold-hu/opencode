@@ -4,7 +4,7 @@ import { makeLocationNode } from "@opencode/util/effect/app-node"
 import path from "path"
 import { isDeepStrictEqual } from "node:util"
 import { applyEdits, modify, type ParseError, parse } from "jsonc-parser"
-import { Context, Effect, FiberMap, Layer, Option, PubSub, Ref, Schema, Semaphore, Stream } from "effect"
+import { Context, Effect, Either, FiberMap, Layer, Option, PubSub, Ref, Schema, Semaphore, Stream } from "effect"
 import { Directory, Document, Info, type Patch, type Entry, Event } from "@opencode/schema/config"
 import { Credential } from "./credential.js"
 import { Bus } from "./bus.js"
@@ -106,7 +106,29 @@ export const layer = (options?: Options) =>
       const reloadLock = Semaphore.makeUnsafe(1)
       const updateLock = Semaphore.makeUnsafe(1)
       const decodeOptions = { errors: "all", onExcessProperty: "ignore" } as const
-      const decodeInfo = Schema.decodeUnknownOption(Info, decodeOptions)
+      const decodeInfo = Schema.decodeUnknownEither(Info, decodeOptions)
+      const formatIssuePath = (issue: Schema.ParseIssue): string => {
+        const segments: Array<string | number> = []
+        let current: Schema.ParseIssue | undefined = issue
+        while (current && current._tag === "Pointer") {
+          segments.unshift(current.path)
+          current = current.issues[0]
+        }
+        return segments.length === 0 ? "$" : `$${segments.map((s) => (typeof s === "number" ? `[${s}]` : `.${s}`)).join("")}`
+      }
+      const getFirstIssue = (issue: Schema.ParseIssue): { path: string; message: string } => {
+        const path = formatIssuePath(issue)
+        if (issue._tag === "Pointer") {
+          const head = issue.issues[0]
+          if (head) return getFirstIssue(head)
+        }
+        if (issue._tag === "Type" || issue._tag === "Missing" || issue._tag === "Unexpected") {
+          return { path, message: issue.message ?? "invalid value" }
+        }
+        const nested = (issue as { issues?: ReadonlyArray<Schema.ParseIssue> }).issues?.[0]
+        if (nested) return getFirstIssue(nested)
+        return { path, message: "rejected canonical configuration after final validation" }
+      }
       const parseInfo = Effect.fn("Config.parseInfo")(function* (text: string, source: string) {
         const errors: ParseError[] = []
         const input: unknown = parse(text, errors, { allowTrailingComma: true })
@@ -129,13 +151,14 @@ export const layer = (options?: Options) =>
           }),
         )
         if (result.type === "rejected") return
-        const info = Option.getOrUndefined(decodeInfo(result.encoded))
-        if (info) return info
+        const decoded = decodeInfo(result.encoded)
+        if (Either.isRight(decoded)) return decoded.right
+        const firstIssue = getFirstIssue(decoded.left)
         yield* Effect.logWarning("configuration normalization diagnostic", {
           source,
-          path: "$",
+          path: firstIssue.path,
           kind: "invalid",
-          action: "rejected canonical configuration after final validation",
+          action: firstIssue.message,
         })
       })
 
