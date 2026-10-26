@@ -507,6 +507,90 @@ it.effect("auto compaction estimates current content against the buffered prompt
   }),
 )
 
+it.effect("auto compaction caps a buffer larger than the default reserve at the reserve", () =>
+  Effect.gen(function* () {
+    const compaction = yield* SessionCompaction.Service
+    const session = yield* insertSession(Session.ID.make("ses_buffer_ceiling_floor"))
+    const input = (tokens: number, limit: { context: number; input?: number; output: number }) => ({
+      session,
+      model: SessionRunnerModel.resolved(model, {
+        capabilities: { tools: true, input: ["text", "image", "pdf"], output: ["text"] },
+        cost: [],
+        limit,
+      }),
+      messages: [
+        Schema.decodeUnknownSync(SessionMessage.Assistant)({
+          id: SessionMessage.ID.make("msg_assistant"),
+          type: "assistant",
+          agent: Agent.defaultID,
+          model: { id: "summary-model", providerID: "test" },
+          content: [{ type: "text", text: "Done" }],
+          tokens: { input: tokens, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          time: { created: 0, completed: 0 },
+        }),
+      ],
+      agent: {
+        id: Agent.defaultID,
+        info: { ...Agent.Info.default(Agent.defaultID), system: "You are a helpful assistant." },
+      },
+      initial: "Project instructions.",
+      tools: {
+        definitions: [ToolDefinition.make({ name: "read", description: "Read files", inputSchema: { type: "object" } })],
+        execute: () => Effect.die("unused"),
+      },
+    })
+    const due = (context: SessionContext.Loaded) =>
+      compaction.compact({ reason: "auto", context }).pipe(Effect.map((outcome) => outcome.status !== "skipped"))
+
+    // The #58774 case: buffer 180904 against an input limit of 195904. The default reserve is
+    // max(15% of 195904, 16000) = 29385, so the ceiling is 166519, not 15000.
+    const issue = { context: 200_000, input: 195_904, output: 4_096 }
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* compaction.transform((editor) => editor.configure({ buffer: 180_904 }))
+        expect(yield* due(input(15_000, issue))).toBe(false)
+        expect(yield* due(input(166_518, issue))).toBe(false)
+        expect(yield* due(input(166_519, issue))).toBe(true)
+      }),
+    )
+
+    // A buffer at or above the window still falls back to the default reserve.
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* compaction.transform((editor) => editor.configure({ buffer: 600_000 }))
+        expect(yield* due(input(166_518, issue))).toBe(false)
+        expect(yield* due(input(166_519, issue))).toBe(true)
+      }),
+    )
+
+    // A buffer below the reserve is honored exactly as before.
+    const contextLimited = { context: 100_000, output: 10_000 }
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* compaction.transform((editor) => editor.configure({ buffer: 5_000 }))
+        expect(yield* due(input(94_999, contextLimited))).toBe(false)
+        expect(yield* due(input(95_000, contextLimited))).toBe(true)
+      }),
+    )
+
+    // The clamp engages right above the reserve and stays off right below it.
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* compaction.transform((editor) => editor.configure({ buffer: 29_386 }))
+        expect(yield* due(input(166_518, issue))).toBe(false)
+        expect(yield* due(input(166_519, issue))).toBe(true)
+      }),
+    )
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        yield* compaction.transform((editor) => editor.configure({ buffer: 29_384 }))
+        expect(yield* due(input(166_519, issue))).toBe(false)
+        expect(yield* due(input(166_520, issue))).toBe(true)
+      }),
+    )
+  }),
+)
+
 /** Seeds the global project plus one session row, returning the projected session. */
 const insertSession = (id: Session.ID, overrides?: Partial<typeof SessionTable.$inferInsert>) =>
   Effect.gen(function* () {

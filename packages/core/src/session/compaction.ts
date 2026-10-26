@@ -1106,9 +1106,11 @@ const calculateCeiling = (limit: SessionContext.Loaded["model"]["limit"], buffer
   // all, only a provider rejection can limit the request.
   const window = limit.input || limit.context
   if (window <= 0) return Number.POSITIVE_INFINITY
-  // A buffer that leaves no room, such as one set for a larger model, is ignored.
-  if (buffer !== undefined && buffer < window) return window - buffer
-  return window - Math.max(Math.floor(window * RESERVE_SHARE), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0)
+  // A buffer larger than the default reserve is capped at it, so it may pull the ceiling down to the no-buffer
+  // ceiling but never below it. A buffer set for a larger model, or one close to the window, therefore degrades
+  // to the default instead of collapsing the session with near-immediate compaction.
+  const reserve = Math.max(Math.floor(window * RESERVE_SHARE), window >= 2 * RESERVE_MIN ? RESERVE_MIN : 0)
+  return window - Math.min(buffer ?? Number.POSITIVE_INFINITY, reserve)
 }
 
 /** The largest summary request that leaves `RESERVE_MIN` of the window for the summary. Zero for an unknown window. */
