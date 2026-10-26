@@ -244,6 +244,38 @@ describe("OpencodePlugin", () => {
     ),
   )
 
+  it.live("surfaces the device-code rate limit with its retry-after", () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() =>
+        Bun.serve({
+          port: 0,
+          fetch: () =>
+            Response.json(
+              { error: "slow_down", error_description: "Too many authorization requests" },
+              { status: 429, headers: { "retry-after": "7" } },
+            ),
+        }),
+      ),
+      (server) =>
+        Effect.gen(function* () {
+          yield* addPlugin()
+          const integrations = yield* Integration.Service
+          const error = yield* integrations.oauth
+            .connect({
+              integrationID: Integration.ID.make("opencode"),
+              methodID: Integration.MethodID.make("device"),
+              answer: { server: server.url.origin },
+            })
+            .pipe(Effect.flip)
+          expect(error).toBeInstanceOf(Integration.AuthorizationError)
+          expect(String(error.cause)).toContain("HTTP 429")
+          expect(String(error.cause)).toContain("retry after 7")
+          expect(String(error.cause)).toContain("slow_down")
+        }),
+      (server) => Effect.promise(() => server.stop(true)),
+    ),
+  )
+
   for (const orgID of ["org-z", undefined, null, "org-missing"]) {
     it.live(`uses the device token organization during authorization: ${orgID}`, () =>
       Effect.acquireUseRelease(
@@ -681,6 +713,50 @@ describe("OpencodePlugin", () => {
             { id: Model.VariantID.make("low"), settings: { reasoningEffort: "low" } },
             { id: Model.VariantID.make("high"), settings: { reasoningEffort: "high" } },
           ])
+        }),
+      (server) => Effect.promise(() => server.stop(true)),
+    ),
+  )
+
+  it.live("applies provider compatibility from Console config and keeps model overrides", () =>
+    Effect.acquireUseRelease(
+      Effect.sync(() =>
+        Bun.serve({
+          port: 0,
+          fetch: () =>
+            Response.json({
+              providers: {
+                remote: {
+                  package: "aisdk:@ai-sdk/openai-compatible",
+                  settings: { baseURL: "https://gateway.audit.invalid/v1" },
+                  compatibility: { maxTokensField: "max_tokens" },
+                  models: {
+                    inherited: {},
+                    overridden: { compatibility: { maxTokensField: "max_completion_tokens" } },
+                  },
+                },
+              },
+            }),
+        }),
+      ),
+      (server) =>
+        Effect.gen(function* () {
+          const credentials = yield* Credential.Service
+          const providers = yield* Provider.Service
+          const models = yield* Model.Service
+          yield* credentials.create({
+            integrationID: Integration.ID.make("opencode"),
+            value: Credential.Key.make({ type: "key", key: "secret", metadata: { server: server.url.origin } }),
+          })
+
+          yield* addPlugin()
+
+          const provider = required(yield* providers.get(Provider.ID.make("remote")))
+          expect(provider.compatibility).toMatchObject({ maxTokensField: "max_tokens" })
+          const inherited = required(yield* models.get(Provider.ID.make("remote"), Model.ID.make("inherited")))
+          expect(inherited.compatibility).toMatchObject({ maxTokensField: "max_tokens" })
+          const overridden = required(yield* models.get(Provider.ID.make("remote"), Model.ID.make("overridden")))
+          expect(overridden.compatibility).toMatchObject({ maxTokensField: "max_completion_tokens" })
         }),
       (server) => Effect.promise(() => server.stop(true)),
     ),
@@ -1373,7 +1449,7 @@ describe("OpencodePlugin", () => {
 
           expect((yield* integrations.get(Integration.ID.make("opencode")))?.connections[0]?.status).toEqual({
             status: "needs_auth",
-            message: "Reconnect OpenCode Console to continue",
+            message: "Reconnect OpenCode Console to continue; use /connect or run `opencode auth login opencode`",
           })
           expect((yield* credentials.get(credential.id))?.value).toMatchObject({ refresh: "revoked" })
         }),
@@ -1416,7 +1492,10 @@ describe("OpencodePlugin", () => {
           yield* addPlugin().pipe(inProcess(server))
           yield* drain
 
-          expect(yield* status()).toEqual({ status: "needs_auth", message: "Reconnect OpenCode Console to continue" })
+          expect(yield* status()).toEqual({
+            status: "needs_auth",
+            message: "Reconnect OpenCode Console to continue; use /connect or run `opencode auth login opencode`",
+          })
           expect((yield* credentials.get(credential.id))?.value).toMatchObject({ access: "revoked" })
 
           state.revoked = false
